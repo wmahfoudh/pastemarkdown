@@ -1,6 +1,6 @@
 # PasteMarkdown 🚀
 
-Lightweight VBA solution to **paste Markdown** into Microsoft Word or Outlook without manual formatting! 🎉
+Lightweight VBA solution to **paste Markdown** into Microsoft Word or Outlook to avoid manual formatting! 🎉
 
 ## 🌟 Overview
 
