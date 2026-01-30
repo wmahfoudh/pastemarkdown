@@ -2,8 +2,8 @@
 ' Markdown-to-Word VBA Macro
 ' --------------------------------------------------------------------------
 ' References required:
-'   - Microsoft Forms 2.0 Object Library
-'   - Microsoft VBScript Regular Expressions 5.5
+'   - Microsoft Forms 2.0 Object Library (FM20.DLL found in system32)
+'   - Microsoft VBScript Regular Expressions 5.5 (vbscript.dll found in system32)
 ' --------------------------------------------------------------------------
 
 Option Explicit
