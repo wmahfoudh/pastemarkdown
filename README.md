@@ -47,11 +47,7 @@ This macro covers many common Markdown features, but **does not support**:
 * Task lists (`- [ ]`, `- [x]`)
 * Definition lists, math formulas, and HTML blocks
 
-❗️ It’s unlikely these will be added in the future—feel free to customize or extend if you need them!
-
-## 🤝 Contributing
-
-Pull requests, issues, and suggestions are welcome! Feel free to fork, extend, or improve.
+❗️ It’s unlikely these will be added in the future—feel free to fork, customize or extend if you need them!
 
 ## 📜 License
 
