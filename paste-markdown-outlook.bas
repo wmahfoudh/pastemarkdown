@@ -2,9 +2,9 @@
 ' Markdown-to-OutlookEmail VBA Macro
 ' --------------------------------------------------------------------------
 ' References required:
-'   - Microsoft Forms 2.0 Object Library
-'   - Microsoft VBScript Regular Expressions 5.5
-'   - Microsoft Word xx.x Object Library
+'   - Microsoft Forms 2.0 Object Library (FM20.DLL found in system32)
+'   - Microsoft VBScript Regular Expressions 5.5 (vbscript.dll found in system32)
+'   - Microsoft Word xx.x Object Library (MSWORD.OLB)
 ' --------------------------------------------------------------------------
 
 Option Explicit
