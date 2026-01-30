@@ -28,7 +28,7 @@ Ideal for inserting Markdown (e.g., AI-generated text) into documents or emails 
 
 1. Open the VBA editor (Alt + F11) in Word or Outlook.
 2. Insert a new module and paste the corresponding code from this repository.
-3. Enable the references listed above (Tools → References).
+3. Enable/Add the references listed in the first comment lines of each macro (Tools → References).
 4. Place your cursor where you want to paste Markdown.
 5. Run the **`PasteMarkdown`** (Word) or **`PasteMarkdownInEmail`** (Outlook) macro.
 
