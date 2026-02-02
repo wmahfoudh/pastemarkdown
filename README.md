@@ -21,7 +21,7 @@ Ideal for inserting Markdown (e.g., AI-generated text) into documents or emails 
 
 ## Versions
 
-1. **Word**: VBA macro to paste Markdown into MS Word documents.
+1. **Word**: VBA macro to paste Markdown into MS Word documents. The "**pro**" version is a complete rewrite that handles large inputs.
 2. **Outlook**: VBA macro to paste Markdown into Outlook email editor.
 
 ## Installation & Usage
