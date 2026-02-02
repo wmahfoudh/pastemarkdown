@@ -1,7 +1,7 @@
 ' ==========================================================================
-' MODULE:       MarkdownToWord_Pro
+' MODULE:       paste-markdown-word-pro
 ' DESCRIPTION:  Converts Markdown syntax on the clipboard to formatted Word
-'               text. Optimized for large documents (2000+ lines).
+'               text. Optimized for large documents.
 '
 ' DEPENDENCIES:
 '   1. Microsoft VBScript Regular Expressions 5.5
@@ -12,7 +12,7 @@
 '   - Non-Destructive:      Deletes Markdown markers (###) but styles existing text.
 '   - Memory Management:    Clears Undo Stack to prevent RAM overflow on large files.
 '   - Stability Checks:     Disables SpellCheck/Pagination to prevent freezing.
-'   - Tested on 2500-3000 lines inputs, takes typically 200-300 seconds
+'   - Tested:               2500-3000 lines inputs, takes typically 200-250 seconds.
 ' ==========================================================================
 
 Option Explicit
