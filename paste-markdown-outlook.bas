@@ -1,355 +1,899 @@
-' --------------------------------------------------------------------------
-' Markdown-to-OutlookEmail VBA Macro
-' --------------------------------------------------------------------------
-' References required:
-'   - Microsoft Forms 2.0 Object Library (FM20.DLL found in system32)
-'   - Microsoft VBScript Regular Expressions 5.5 (vbscript.dll found in system32)
-'   - Microsoft Word xx.x Object Library (MSWORD.OLB)
-' --------------------------------------------------------------------------
+' ==========================================================================
+' MODULE:       OutlookMarkdownPaster
+' DESCRIPTION:  Pastes Clipboard Markdown into Outlook Email as Formatted Text
+' DEPENDENCIES: 1. Microsoft Word 16.0 Object Library
+'
+' Notes:
+' - Uses late-bound VBScript.RegExp, so no explicit Regex reference is required.
+' - Designed for Outlook emails using Word as editor.
+' ==========================================================================
 
 Option Explicit
 
-' Ensure a paragraph style named "Code" exists in the given Word document; create it if missing.
-Private Sub EnsureCodeStyle(doc As Word.Document)
-    Dim sty As Word.Style
+' --------------------------------------------------------------------------
+' CONFIGURATION
+' --------------------------------------------------------------------------
+Private Const REMOVE_EMPTY_PARAGRAPHS_AFTER_PASTE As Boolean = False
+Private Const CODE_STYLE_NAME As String = "Code"
 
-    On Error Resume Next
-    Set sty = doc.Styles("Code")
-    On Error GoTo 0
-
-    If sty Is Nothing Then
-        Set sty = doc.Styles.Add(Name:="Code", Type:=wdStyleTypeParagraph)
-        sty.Font.Name = "Consolas"
-        sty.Shading.BackgroundPatternColor = wdColorGray15
-    End If
-End Sub
-
-' Entry point: retrieves Markdown from clipboard and processes it inside the active email.
-Public Sub PasteMarkdownInEmail()
-    Dim insp      As Outlook.Inspector
-    Dim wdDoc     As Word.Document
-    Dim selRange  As Word.Range
-    Dim dataObj   As New MSForms.DataObject
-    Dim clipText  As String
-    Dim rng       As Word.Range
-    Dim para      As Word.Paragraph
-
-    ' Get the active inspector and ensure it's a Word-editor email.
+' --------------------------------------------------------------------------
+' PUBLIC MACRO: Link this to your Ribbon Button
+' --------------------------------------------------------------------------
+Public Sub PasteMarkdownToEmail()
+    Dim insp As Outlook.Inspector
+    Dim doc As Word.Document
+    Dim sel As Word.Selection
+    Dim rng As Word.Range
+    Dim startPos As Long
+    Dim endPos As Long
+    
+    ' 1. Validate we are in an email editor
     Set insp = Application.ActiveInspector
     If insp Is Nothing Then Exit Sub
     If insp.EditorType <> olEditorWord Then Exit Sub
-
-    ' Reference the WordEditor for the open mail item.
-    Set wdDoc = insp.WordEditor
-
-    ' Retrieve Markdown text from clipboard (format=1).
+    
+    ' 2. Get the Word Editor
+    Set doc = insp.WordEditor
+    Set sel = doc.Windows(1).Selection
+    
+    ' 3. Performance settings
+    Dim wasSpell As Boolean
+    Dim wasScreenUpdating As Boolean
+    
+    wasSpell = doc.Application.Options.CheckSpellingAsYouType
+    wasScreenUpdating = doc.Application.ScreenUpdating
+    
+    doc.Application.ScreenUpdating = False
+    doc.Application.Options.CheckSpellingAsYouType = False
+    
+    On Error GoTo FailSafe
+    
+    EnsureCodeStyle doc
+    
+    ' 4. Paste clipboard as plain text
+    startPos = sel.Range.Start
+    
     On Error Resume Next
-    dataObj.GetFromClipboard
-    clipText = dataObj.GetText(1)
-    If Err.Number <> 0 Or Len(Trim$(clipText)) = 0 Then Exit Sub
-    On Error GoTo 0
-
-    ' Insert raw Markdown at the current cursor position.
-    Set selRange = wdDoc.Application.Selection.Range
-    selRange.Text = clipText
-
-    ' Define range covering the inserted Markdown.
-    Set rng = wdDoc.Range(Start:=selRange.Start, End:=selRange.End)
-
-    ' Improve performance by disabling screen updating and pagination.
-    With wdDoc.Application
-        .ScreenUpdating = False
-        .Options.Pagination = False
+    sel.PasteSpecial Link:=False, DataType:=wdPasteText, Placement:=wdInLine, DisplayAsIcon:=False
+    
+    If Err.Number <> 0 Then
+        Err.Clear
+        MsgBox "Clipboard is empty or invalid.", vbExclamation
+        GoTo Cleanup
+    End If
+    On Error GoTo FailSafe
+    
+    endPos = sel.Range.End
+    
+    If endPos <= startPos Then GoTo Cleanup
+    
+    ' 5. Process only the pasted content
+    Set rng = doc.Range(Start:=startPos, End:=endPos)
+    
+    ' Normalize manual line breaks to paragraphs
+    With rng.Find
+        .ClearFormatting
+        .Replacement.ClearFormatting
+        .Text = "^l"
+        .Replacement.Text = "^p"
+        .Forward = True
+        .Wrap = wdFindStop
+        .Execute Replace:=wdReplaceAll
     End With
+    
+    ' Refresh range after line-break normalization
+    Set rng = doc.Range(Start:=startPos, End:=endPos)
+    
+    ' 6. Run Markdown processing
+    ProcessCodeBlocks rng
+    ProcessMarkdownTables rng
+    ProcessFormattingReverse rng
+    
+    If REMOVE_EMPTY_PARAGRAPHS_AFTER_PASTE Then
+        RemoveEmptyParagraphs rng
+    End If
+    
+    ' 7. Outlook cleanup
+    doc.UndoClear
+    
+Cleanup:
+    On Error Resume Next
+    doc.Application.Options.CheckSpellingAsYouType = wasSpell
+    doc.Application.ScreenUpdating = wasScreenUpdating
+    On Error GoTo 0
+    Exit Sub
 
-    ' Ensure the "Code" style exists in this document.
-    EnsureCodeStyle wdDoc
+FailSafe:
+    MsgBox "Markdown paste failed: " & Err.Description, vbExclamation
+    Resume Cleanup
+End Sub
 
-    ' Parse fenced code blocks before other block-level elements.
-    ParseFencedCodeBlocks rng
-
-    ' Parse block-level elements: blockquotes, headings, and lists.
-    For Each para In rng.Paragraphs
-        ParseBlockquotes para.Range
-        ParseHeading     para.Range
-        ParseList        para.Range
-    Next para
-
-    ' Parse inline-level elements.
-    ParseInline        rng
-    ParseInlineCode    rng
-    ParseStrikethrough rng
-    ParseLinks         rng
-
-    ' Restore Word application settings.
-    With wdDoc.Application
-        .ScreenUpdating = True
-        .Options.Pagination = True
+' --------------------------------------------------------------------------
+' HELPER: Styles
+' --------------------------------------------------------------------------
+Private Sub EnsureCodeStyle(doc As Word.Document)
+    Dim sty As Word.Style
+    
+    On Error Resume Next
+    Set sty = doc.Styles(CODE_STYLE_NAME)
+    On Error GoTo 0
+    
+    If sty Is Nothing Then
+        Set sty = doc.Styles.Add(Name:=CODE_STYLE_NAME, Type:=wdStyleTypeParagraph)
+    End If
+    
+    With sty
+        .Font.Name = "Consolas"
+        .Font.Color = wdColorBlack
+        .Font.Size = 10
+        .Shading.BackgroundPatternColor = wdColorGray15
+        .NoSpaceBetweenParagraphsOfSameStyle = True
+        .ParagraphFormat.SpaceBefore = 0
+        .ParagraphFormat.SpaceAfter = 0
     End With
 End Sub
 
-' Convert fenced code blocks (``` ... ```) to the "Code" style.
-Private Sub ParseFencedCodeBlocks(rng As Word.Range)
-    Dim para         As Word.Paragraph
-    Dim inCode       As Boolean
-    Dim codeStart    As Long
-    Dim fencePattern As RegExp
-    Dim txt          As String
-    Dim codeRange    As Word.Range
-
-    Set fencePattern = New RegExp
-    fencePattern.Pattern = "^```.*\r?$"
-    fencePattern.Global  = False
-
+' --------------------------------------------------------------------------
+' LOGIC: Code Blocks
+' --------------------------------------------------------------------------
+Private Sub ProcessCodeBlocks(rng As Word.Range)
+    Dim para As Word.Paragraph
+    Dim inCode As Boolean
+    Dim i As Long
+    Dim txt As String
+    Dim doc As Word.Document
+    
+    Set doc = rng.Parent
+    
+    Dim reFence As Object
+    Set reFence = CreateObject("VBScript.RegExp")
+    reFence.Pattern = "^\s*```"
+    reFence.Global = False
+    reFence.IgnoreCase = True
+    
     inCode = False
-    For Each para In rng.Paragraphs
-        txt = Trim(para.Range.Text)
-        If Not inCode Then
-            If fencePattern.Test(txt) Then
-                inCode = True
-                codeStart = para.Range.Start
+    
+    For i = 1 To rng.Paragraphs.Count
+        If i > rng.Paragraphs.Count Then Exit For
+        
+        Set para = rng.Paragraphs(i)
+        txt = para.Range.Text
+        
+        If InStr(1, txt, "`", vbBinaryCompare) > 0 Then
+            If reFence.Test(txt) Then
                 para.Range.Delete
-            End If
-        Else
-            If fencePattern.Test(txt) Then
-                Set codeRange = rng.Document.Range(Start:=codeStart, End:=para.Range.End)
-                para.Range.Delete
-                codeRange.Style = rng.Document.Styles("Code")
-                inCode = False
+                inCode = Not inCode
+                i = i - 1
+                GoTo NextIter
             End If
         End If
-    Next para
-End Sub
-
-' Convert Markdown blockquotes ("> text") to the built-in "Quote" style.
-Private Sub ParseBlockquotes(rng As Word.Range)
-    Dim re As RegExp
-    Dim m  As Match
-
-    Set re = New RegExp
-    re.Pattern = "^>\s*(.+)$"
-    re.Global  = False
-
-    If re.Test(rng.Text) Then
-        Set m = re.Execute(rng.Text)(0)
-        rng.Text = m.SubMatches(0)
-        rng.Style = rng.Document.Styles("Quote")
-    End If
-End Sub
-
-' Convert Markdown headings (# through ######) to Word Heading styles.
-Private Sub ParseHeading(rng As Word.Range)
-    Dim re      As RegExp
-    Dim mcol    As MatchCollection
-    Dim m       As Match
-    Dim lvl     As Long
-    Dim txt     As String
-
-    Set re = New RegExp
-    re.Pattern = "^(#{1,6})\s*(.+)$"
-    re.Global  = False
-
-    If re.Test(rng.Text) Then
-        Set mcol = re.Execute(rng.Text)
-        Set m    = mcol(0)
-        lvl      = Len(m.SubMatches(0))
-        txt      = m.SubMatches(1)
-        rng.Text = txt
-        rng.Style = rng.Document.Styles("Heading " & lvl)
-    End If
-End Sub
-
-' Convert Markdown unordered (*) and ordered (1.) lists to Word lists.
-Private Sub ParseList(rng As Word.Range)
-    Dim reU     As RegExp
-    Dim reO     As RegExp
-    Dim m       As Match
-    Dim spaces  As String
-    Dim content As String
-    Dim indent  As Long
-    Dim i       As Long
-
-    Set reU = New RegExp
-    reU.Pattern = "^(\s*)([-\*\+])\s+(.+)$"
-    reU.Global  = False
-
-    If reU.Test(rng.Text) Then
-        Set m       = reU.Execute(rng.Text)(0)
-        spaces      = m.SubMatches(0)
-        content     = m.SubMatches(2)
-        rng.Text    = content
-        rng.ListFormat.ApplyBulletDefault
-        indent      = Len(spaces) \ 2 + 1
-        For i = 2 To indent: rng.ListFormat.ListIndent: Next i
-        Exit Sub
-    End If
-
-    Set reO = New RegExp
-    reO.Pattern = "^(\s*)(\d+)\.\s+(.+)$"
-    reO.Global  = False
-
-    If reO.Test(rng.Text) Then
-        Set m       = reO.Execute(rng.Text)(0)
-        spaces      = m.SubMatches(0)
-        content     = m.SubMatches(2)
-        rng.Text    = content
-        rng.ListFormat.ApplyNumberDefault
-        indent      = Len(spaces) \ 2 + 1
-        For i = 2 To indent: rng.ListFormat.ListIndent: Next i
-    End If
-End Sub
-
-' Apply bold and italic formatting for ***, **, and * markers.
-Private Sub ParseInline(rng As Word.Range)
-    Dim patterns As Variant
-    Dim i        As Long
-
-    ' List of regex patterns: bold+italic, bold, italic
-    patterns = Array( _
-        "(\*\*\*|___)(.+?)\1", _
-        "(\*\*|__)(.+?)\1", _
-        "(\*|_)(.+?)\1" _
-    )
-
-    For i = LBound(patterns) To UBound(patterns)
-        ApplyInlineFormatting rng, CStr(patterns(i)), CLng(i)
+        
+        If inCode Then
+            para.Style = doc.Styles(CODE_STYLE_NAME)
+            para.Range.NoProofing = True
+        End If
+        
+NextIter:
     Next i
 End Sub
 
-' Convert inline code spans (`code`) to Consolas with shading.
-Private Sub ParseInlineCode(rng As Word.Range)
-    Dim re      As RegExp
-    Dim mcol    As MatchCollection
-    Dim m       As Match
-    Dim marker  As String
+' --------------------------------------------------------------------------
+' LOGIC: Markdown Tables
+' Converts standard Markdown pipe tables into native Word tables.
+'
+' Example:
+' | Topic | Owner | Status |
+' |---|---|---|
+' | Item | Walid | Open |
+'
+' Alignment supported:
+' | Left | Center | Right |
+' |:---|:---:|---:|
+' --------------------------------------------------------------------------
+Private Sub ProcessMarkdownTables(rng As Word.Range)
+    Dim i As Long
+    Dim total As Long
+    
+    total = rng.Paragraphs.Count
+    
+    ' Bottom-up to avoid paragraph index shifts after conversion
+    For i = total - 1 To 1 Step -1
+        
+        If i + 1 <= rng.Paragraphs.Count Then
+            
+            Dim headerText As String
+            Dim separatorText As String
+            
+            headerText = CleanParaText(rng.Paragraphs(i).Range.Text)
+            separatorText = CleanParaText(rng.Paragraphs(i + 1).Range.Text)
+            
+            If Not IsParagraphCode(rng.Paragraphs(i)) _
+               And Not IsParagraphCode(rng.Paragraphs(i + 1)) _
+               And LooksLikeMarkdownTableRow(headerText) _
+               And IsMarkdownTableSeparator(separatorText) Then
+                
+                Dim startPara As Long
+                Dim endPara As Long
+                Dim j As Long
+                
+                startPara = i
+                endPara = i + 1
+                j = i + 2
+                
+                Do While j <= rng.Paragraphs.Count
+                    If IsParagraphCode(rng.Paragraphs(j)) Then Exit Do
+                    
+                    Dim rowText As String
+                    rowText = CleanParaText(rng.Paragraphs(j).Range.Text)
+                    
+                    If LooksLikeMarkdownTableRow(rowText) Then
+                        endPara = j
+                        j = j + 1
+                    Else
+                        Exit Do
+                    End If
+                Loop
+                
+                ConvertMarkdownTableBlock rng, startPara, endPara
+            End If
+        End If
+    Next i
+End Sub
+
+Private Sub ConvertMarkdownTableBlock(rng As Word.Range, startPara As Long, endPara As Long)
+    Dim doc As Word.Document
+    Set doc = rng.Parent
+    
+    Dim rows As Collection
+    Set rows = New Collection
+    
+    Dim separatorCells As Variant
+    Dim alignments As Variant
+    Dim colCount As Long
+    Dim i As Long
+    
+    Dim headerCells As Variant
+    headerCells = SplitMarkdownTableRow(CleanParaText(rng.Paragraphs(startPara).Range.Text))
+    colCount = ArrayItemCount(headerCells)
+    rows.Add headerCells
+    
+    separatorCells = SplitMarkdownTableRow(CleanParaText(rng.Paragraphs(startPara + 1).Range.Text))
+    
+    For i = startPara + 2 To endPara
+        Dim dataCells As Variant
+        dataCells = SplitMarkdownTableRow(CleanParaText(rng.Paragraphs(i).Range.Text))
+        
+        If ArrayItemCount(dataCells) > colCount Then
+            colCount = ArrayItemCount(dataCells)
+        End If
+        
+        rows.Add dataCells
+    Next i
+    
+    alignments = GetMarkdownTableAlignments(separatorCells, colCount)
+    
+    Dim tableText As String
+    tableText = BuildTabDelimitedTableText(rows, colCount)
+    
+    Dim blockStart As Long
+    Dim blockEnd As Long
+    blockStart = rng.Paragraphs(startPara).Range.Start
+    blockEnd = rng.Paragraphs(endPara).Range.End
+    
+    Dim blockRng As Word.Range
+    Set blockRng = doc.Range(blockStart, blockEnd)
+    blockRng.Text = tableText
+    
+    Set blockRng = doc.Range(blockStart, blockStart + Len(tableText))
+    
+    Dim tbl As Word.Table
+    Set tbl = blockRng.ConvertToTable( _
+        Separator:=wdSeparateByTabs, _
+        NumColumns:=colCount, _
+        AutoFitBehavior:=wdAutoFitWindow)
+    
+    FormatMarkdownTable tbl, alignments
+End Sub
+
+Private Function BuildTabDelimitedTableText(rows As Collection, colCount As Long) As String
+    Dim result As String
+    Dim r As Long
+    Dim c As Long
+    
+    For r = 1 To rows.Count
+        Dim cells As Variant
+        cells = rows(r)
+        
+        For c = 0 To colCount - 1
+            If c <= UBound(cells) Then
+                result = result & CleanMarkdownTableCell(CStr(cells(c)))
+            End If
+            
+            If c < colCount - 1 Then
+                result = result & vbTab
+            End If
+        Next c
+        
+        result = result & vbCr
+    Next r
+    
+    BuildTabDelimitedTableText = result
+End Function
+
+Private Sub FormatMarkdownTable(tbl As Word.Table, alignments As Variant)
+    On Error Resume Next
+    
+    tbl.Borders.Enable = True
+    tbl.AutoFitBehavior wdAutoFitWindow
+    
+    With tbl.Range
+        .Font.Name = "Calibri"
+        .Font.Size = 11
+    End With
+    
+    With tbl.rows(1).Range
+        .Font.Bold = True
+        .Shading.BackgroundPatternColor = wdColorGray15
+    End With
+    
+    Dim c As Long
+    Dim cell As Word.cell
+    
+    For c = 1 To tbl.Columns.Count
+        For Each cell In tbl.Columns(c).cells
+            cell.Range.ParagraphFormat.Alignment = CLng(alignments(c - 1))
+        Next cell
+    Next c
+    
+    tbl.TopPadding = 3
+    tbl.BottomPadding = 3
+    tbl.LeftPadding = 4
+    tbl.RightPadding = 4
+    
+    On Error GoTo 0
+End Sub
+
+Private Function CleanParaText(ByVal s As String) As String
+    s = Replace(s, vbCr, "")
+    s = Replace(s, vbLf, "")
+    CleanParaText = Trim(s)
+End Function
+
+Private Function IsParagraphCode(para As Word.Paragraph) As Boolean
+    On Error Resume Next
+    IsParagraphCode = (para.Style = CODE_STYLE_NAME)
+    On Error GoTo 0
+End Function
+
+Private Function LooksLikeMarkdownTableRow(ByVal s As String) As Boolean
+    s = Trim(s)
+    
+    If Len(s) = 0 Then
+        LooksLikeMarkdownTableRow = False
+        Exit Function
+    End If
+    
+    If InStr(1, s, "|", vbBinaryCompare) = 0 Then
+        LooksLikeMarkdownTableRow = False
+        Exit Function
+    End If
+    
+    If IsMarkdownTableSeparator(s) Then
+        LooksLikeMarkdownTableRow = False
+        Exit Function
+    End If
+    
+    Dim cells As Variant
+    cells = SplitMarkdownTableRow(s)
+    
+    LooksLikeMarkdownTableRow = (ArrayItemCount(cells) >= 2)
+End Function
+
+Private Function IsMarkdownTableSeparator(ByVal s As String) As Boolean
+    s = Trim(s)
+    
+    If Len(s) = 0 Then
+        IsMarkdownTableSeparator = False
+        Exit Function
+    End If
+    
+    If InStr(1, s, "|", vbBinaryCompare) = 0 Then
+        IsMarkdownTableSeparator = False
+        Exit Function
+    End If
+    
+    Dim cells As Variant
+    cells = SplitMarkdownTableRow(s)
+    
+    If ArrayItemCount(cells) < 2 Then
+        IsMarkdownTableSeparator = False
+        Exit Function
+    End If
+    
+    Dim i As Long
+    For i = LBound(cells) To UBound(cells)
+        If Not IsMarkdownSeparatorCell(CStr(cells(i))) Then
+            IsMarkdownTableSeparator = False
+            Exit Function
+        End If
+    Next i
+    
+    IsMarkdownTableSeparator = True
+End Function
+
+Private Function IsMarkdownSeparatorCell(ByVal s As String) As Boolean
+    Dim t As String
+    t = Trim(s)
+    t = Replace(t, " ", "")
+    
+    If Len(t) < 3 Then
+        IsMarkdownSeparatorCell = False
+        Exit Function
+    End If
+    
+    If Left(t, 1) = ":" Then t = Mid(t, 2)
+    If Right(t, 1) = ":" Then t = Left(t, Len(t) - 1)
+    
+    If Len(t) < 3 Then
+        IsMarkdownSeparatorCell = False
+        Exit Function
+    End If
+    
+    Dim i As Long
+    For i = 1 To Len(t)
+        If Mid(t, i, 1) <> "-" Then
+            IsMarkdownSeparatorCell = False
+            Exit Function
+        End If
+    Next i
+    
+    IsMarkdownSeparatorCell = True
+End Function
+
+Private Function SplitMarkdownTableRow(ByVal s As String) As Variant
+    s = CleanParaText(s)
+    
+    If Left(s, 1) = "|" Then s = Mid(s, 2)
+    If Right(s, 1) = "|" Then s = Left(s, Len(s) - 1)
+    
+    Dim arr() As String
+    ReDim arr(0 To 0)
+    
+    Dim idx As Long
+    Dim current As String
+    Dim i As Long
+    Dim ch As String
+    
+    idx = 0
+    current = ""
+    i = 1
+    
+    Do While i <= Len(s)
+        ch = Mid(s, i, 1)
+        
+        If ch = "\" And i < Len(s) Then
+            If Mid(s, i + 1, 1) = "|" Then
+                current = current & "|"
+                i = i + 2
+            Else
+                current = current & ch
+                i = i + 1
+            End If
+            
+        ElseIf ch = "|" Then
+            arr(idx) = Trim(current)
+            idx = idx + 1
+            ReDim Preserve arr(0 To idx)
+            current = ""
+            i = i + 1
+            
+        Else
+            current = current & ch
+            i = i + 1
+        End If
+    Loop
+    
+    arr(idx) = Trim(current)
+    
+    SplitMarkdownTableRow = arr
+End Function
+
+Private Function CleanMarkdownTableCell(ByVal s As String) As String
+    s = Trim(s)
+    
+    s = Replace(s, vbTab, " ")
+    
+    ' Convert common Markdown/HTML line breaks inside table cells
+    s = Replace(s, "<br>", Chr(11))
+    s = Replace(s, "<br/>", Chr(11))
+    s = Replace(s, "<br />", Chr(11))
+    
+    CleanMarkdownTableCell = s
+End Function
+
+Private Function GetMarkdownTableAlignments(separatorCells As Variant, colCount As Long) As Variant
+    Dim arr() As Long
+    ReDim arr(0 To colCount - 1)
+    
+    Dim i As Long
+    For i = 0 To colCount - 1
+        If i <= UBound(separatorCells) Then
+            arr(i) = MarkdownAlignmentFromSeparator(CStr(separatorCells(i)))
+        Else
+            arr(i) = wdAlignParagraphLeft
+        End If
+    Next i
+    
+    GetMarkdownTableAlignments = arr
+End Function
+
+Private Function MarkdownAlignmentFromSeparator(ByVal s As String) As Long
+    Dim t As String
+    t = Trim(s)
+    t = Replace(t, " ", "")
+    
+    Dim leftColon As Boolean
+    Dim rightColon As Boolean
+    
+    leftColon = (Left(t, 1) = ":")
+    rightColon = (Right(t, 1) = ":")
+    
+    If leftColon And rightColon Then
+        MarkdownAlignmentFromSeparator = wdAlignParagraphCenter
+    ElseIf rightColon Then
+        MarkdownAlignmentFromSeparator = wdAlignParagraphRight
+    Else
+        MarkdownAlignmentFromSeparator = wdAlignParagraphLeft
+    End If
+End Function
+
+Private Function ArrayItemCount(arr As Variant) As Long
+    ArrayItemCount = UBound(arr) - LBound(arr) + 1
+End Function
+
+' --------------------------------------------------------------------------
+' LOGIC: Formatting
+' --------------------------------------------------------------------------
+Private Sub ProcessFormattingReverse(rng As Word.Range)
+    Dim i As Long
+    Dim para As Word.Paragraph
+    Dim paraRng As Word.Range
+    Dim txt As String
+    Dim total As Long
+    Dim doc As Word.Document
+    
+    Set doc = rng.Parent
+    
+    Dim reHead As Object
+    Dim reQuote As Object
+    Dim reListU As Object
+    Dim reListO As Object
+    Dim reTask As Object
+    Dim reInline As Object
+    Dim reLink As Object
+    Dim reStrike As Object
+    
+    Set reHead = CreateObject("VBScript.RegExp")
+    reHead.Pattern = "^(#{1,6})\s+"
+    reHead.Global = False
+    
+    Set reQuote = CreateObject("VBScript.RegExp")
+    reQuote.Pattern = "^\s*>\s*"
+    reQuote.Global = False
+    
+    Set reTask = CreateObject("VBScript.RegExp")
+    reTask.Pattern = "^(\s*)[-\*\+]\s+\[([ xX])\]\s+"
+    reTask.Global = False
+    
+    Set reListU = CreateObject("VBScript.RegExp")
+    reListU.Pattern = "^(\s*)([-\*\+])\s+"
+    reListU.Global = False
+    
+    Set reListO = CreateObject("VBScript.RegExp")
+    reListO.Pattern = "^(\s*)(\d+)\.\s+"
+    reListO.Global = False
+    
+    Set reInline = CreateObject("VBScript.RegExp")
+    reInline.Global = True
+    
+    Set reLink = CreateObject("VBScript.RegExp")
+    reLink.Pattern = "\[(.+?)\]\((https?:\/\/[^\s\)]+)\)"
+    reLink.Global = True
+    
+    Set reStrike = CreateObject("VBScript.RegExp")
+    reStrike.Pattern = "~~(.+?)~~"
+    reStrike.Global = True
+    
+    total = rng.Paragraphs.Count
+    
+    For i = total To 1 Step -1
+        Set para = rng.Paragraphs(i)
+        
+        If Not IsParagraphCode(para) Then
+            Set paraRng = para.Range
+            txt = paraRng.Text
+            
+            If i Mod 50 = 0 Then doc.UndoClear
+            
+            If Len(txt) > 1 Then
+                
+                ' Block elements
+                If InStr(1, txt, "#", vbBinaryCompare) > 0 Then
+                    If Left(LTrim(txt), 1) = "#" Then ApplyHeading paraRng, reHead
+                End If
+                
+                If InStr(1, txt, ">", vbBinaryCompare) > 0 Then
+                    If Left(LTrim(txt), 1) = ">" Then ApplyQuote paraRng, reQuote
+                End If
+                
+                txt = paraRng.Text
+                
+                If IsTaskListLine(txt, reTask) Then
+                    ApplyTaskList paraRng, reTask
+                ElseIf InStr(1, txt, "-", vbBinaryCompare) > 0 _
+                    Or InStr(1, txt, "*", vbBinaryCompare) > 0 _
+                    Or InStr(1, txt, "+", vbBinaryCompare) > 0 Then
+                    ApplyListU paraRng, reListU
+                ElseIf IsNumeric(Left(LTrim(txt), 1)) Then
+                    ApplyListO paraRng, reListO
+                End If
+                
+                ' Inline elements
+                txt = paraRng.Text
+                
+                If InStr(1, txt, "`", vbBinaryCompare) > 0 Then RunRegexInlineCode paraRng, reInline
+                If InStr(1, txt, "*", vbBinaryCompare) > 0 Or InStr(1, txt, "_", vbBinaryCompare) > 0 Then RunRegexInlineFormat paraRng, reInline
+                If InStr(1, txt, "[", vbBinaryCompare) > 0 Then RunRegexLink paraRng, reLink
+                If InStr(1, txt, "~", vbBinaryCompare) > 0 Then RunRegexStrike paraRng, reStrike
+            End If
+        End If
+    Next i
+End Sub
+
+' --------------------------------------------------------------------------
+' BLOCK FORMAT HELPERS
+' --------------------------------------------------------------------------
+Private Sub ApplyHeading(rng As Word.Range, re As Object)
+    Dim m As Object
+    Dim doc As Word.Document
+    Dim lvl As Long
+    
+    Set doc = rng.Parent
+    
+    If re.Test(rng.Text) Then
+        Set m = re.Execute(rng.Text)(0)
+        lvl = Len(Trim(m.SubMatches(0)))
+        If lvl > 6 Then lvl = 6
+        
+        doc.Range(rng.Start, rng.Start + m.Length).Delete
+        rng.Style = doc.Styles("Heading " & lvl)
+    End If
+End Sub
+
+Private Sub ApplyQuote(rng As Word.Range, re As Object)
+    Dim m As Object
+    Dim doc As Word.Document
+    
+    Set doc = rng.Parent
+    
+    If re.Test(rng.Text) Then
+        Set m = re.Execute(rng.Text)(0)
+        doc.Range(rng.Start, rng.Start + m.Length).Delete
+        rng.Style = doc.Styles("Quote")
+    End If
+End Sub
+
+Private Function IsTaskListLine(ByVal txt As String, re As Object) As Boolean
+    IsTaskListLine = re.Test(txt)
+End Function
+
+Private Sub ApplyTaskList(rng As Word.Range, re As Object)
+    Dim m As Object
+    Dim doc As Word.Document
+    Dim ls As Long
+    Dim checkedMark As String
+    Dim k As Long
+    
+    Set doc = rng.Parent
+    
+    If re.Test(rng.Text) Then
+        Set m = re.Execute(rng.Text)(0)
+        
+        ls = Len(m.SubMatches(0))
+        
+        If LCase(CStr(m.SubMatches(1))) = "x" Then
+            checkedMark = ChrW(&H2611) & " "
+        Else
+            checkedMark = ChrW(&H2610) & " "
+        End If
+        
+        doc.Range(rng.Start, rng.Start + m.Length).Delete
+        rng.InsertBefore checkedMark
+        
+        rng.ListFormat.ApplyBulletDefault
+        
+        For k = 1 To (ls \ 2)
+            rng.ListFormat.ListIndent
+        Next k
+    End If
+End Sub
+
+Private Sub ApplyListU(rng As Word.Range, re As Object)
+    Dim m As Object
+    Dim doc As Word.Document
+    Dim ls As Long
+    Dim k As Long
+    
+    Set doc = rng.Parent
+    
+    If re.Test(rng.Text) Then
+        Set m = re.Execute(rng.Text)(0)
+        ls = Len(m.SubMatches(0))
+        
+        doc.Range(rng.Start, rng.Start + m.Length).Delete
+        rng.ListFormat.ApplyBulletDefault
+        
+        For k = 1 To (ls \ 2)
+            rng.ListFormat.ListIndent
+        Next k
+    End If
+End Sub
+
+Private Sub ApplyListO(rng As Word.Range, re As Object)
+    Dim m As Object
+    Dim doc As Word.Document
+    Dim ls As Long
+    Dim k As Long
+    
+    Set doc = rng.Parent
+    
+    If re.Test(rng.Text) Then
+        Set m = re.Execute(rng.Text)(0)
+        ls = Len(m.SubMatches(0))
+        
+        doc.Range(rng.Start, rng.Start + m.Length).Delete
+        rng.ListFormat.ApplyNumberDefault
+        
+        For k = 1 To (ls \ 2)
+            rng.ListFormat.ListIndent
+        Next k
+    End If
+End Sub
+
+' --------------------------------------------------------------------------
+' INLINE FORMAT HELPERS
+' --------------------------------------------------------------------------
+Private Sub RunRegexInlineCode(rng As Word.Range, re As Object)
+    Dim mCol As Object
+    Dim m As Object
+    Dim startP As Long
     Dim markLen As Long
-    Dim startP  As Long
-    Dim endP    As Long
-    Dim rWhole  As Word.Range
-    Dim rInner  As Word.Range
-
-    Set re = New RegExp
+    Dim rWhole As Word.Range
+    Dim doc As Word.Document
+    
+    Set doc = rng.Parent
+    
     re.Pattern = "(`+)(.+?)\1"
-    re.Global  = True
-
+    
     Do
-        Set mcol = re.Execute(rng.Text)
-        If mcol.Count = 0 Then Exit Do
-        Set m       = mcol(mcol.Count - 1)
-        marker      = m.SubMatches(0)
-        markLen     = Len(marker)
-        startP      = rng.Start + m.FirstIndex
-        endP        = startP + m.Length
-        Set rWhole  = rng.Document.Range(startP, endP)
+        Set mCol = re.Execute(rng.Text)
+        If mCol.Count = 0 Then Exit Do
+        
+        Set m = mCol(mCol.Count - 1)
+        markLen = Len(m.SubMatches(0))
+        startP = rng.Start + m.FirstIndex
+        
+        Set rWhole = doc.Range(startP, startP + m.Length)
+        
         rWhole.Characters.Last.Delete markLen
         rWhole.Characters.First.Delete markLen
-        Set rInner  = rWhole
-        rInner.Font.Name = "Consolas"
-        rInner.Shading.BackgroundPatternColor = wdColorGray15
+        
+        rWhole.Font.Name = "Consolas"
+        rWhole.Font.Color = wdColorBlack
+        rWhole.Shading.BackgroundPatternColor = wdColorGray15
+        rWhole.NoProofing = True
     Loop
 End Sub
 
-' Convert ~~strikethrough~~ to struck text.
-Private Sub ParseStrikethrough(rng As Word.Range)
-    Dim re      As RegExp
-    Dim mcol    As MatchCollection
-    Dim m       As Match
-    Dim startP  As Long
-    Dim endP    As Long
-    Dim rWhole  As Word.Range
+Private Sub RunRegexInlineFormat(rng As Word.Range, re As Object)
+    Dim patterns As Variant
+    Dim types As Variant
+    Dim i As Long
+    
+    patterns = Array("(\*\*\*|___)(.+?)\1", "(\*\*|__)(.+?)\1", "(\*|_)(.+?)\1")
+    types = Array(0, 1, 2)
+    
+    For i = 0 To 2
+        re.Pattern = patterns(i)
+        ApplyFormatSimple rng, re, CLng(types(i))
+    Next i
+End Sub
 
-    Set re = New RegExp
-    re.Pattern = "~~(.+?)~~"
-    re.Global  = True
-
+Private Sub RunRegexLink(rng As Word.Range, re As Object)
+    Dim mCol As Object
+    Dim m As Object
+    Dim startP As Long
+    Dim rWhole As Word.Range
+    Dim doc As Word.Document
+    Dim txt As String
+    Dim url As String
+    
+    Set doc = rng.Parent
+    
     Do
-        Set mcol = re.Execute(rng.Text)
-        If mcol.Count = 0 Then Exit Do
-        Set m      = mcol(mcol.Count - 1)
-        startP     = rng.Start + m.FirstIndex
-        endP       = startP + m.Length
-        Set rWhole = rng.Document.Range(startP, endP)
-        rWhole.Characters.Last.Delete 2
-        rWhole.Characters.First.Delete 2
-        rWhole.Font.StrikeThrough = True
+        Set mCol = re.Execute(rng.Text)
+        If mCol.Count = 0 Then Exit Do
+        
+        Set m = mCol(mCol.Count - 1)
+        startP = rng.Start + m.FirstIndex
+        
+        Set rWhole = doc.Range(startP, startP + m.Length)
+        
+        txt = m.SubMatches(0)
+        url = m.SubMatches(1)
+        
+        rWhole.Text = txt
+        doc.Hyperlinks.Add Anchor:=rWhole, Address:=url, TextToDisplay:=txt
     Loop
 End Sub
 
-' Convert [text](url) to active Word hyperlinks.
-Private Sub ParseLinks(rng As Word.Range)
-    Dim re          As RegExp
-    Dim mcol        As MatchCollection
-    Dim m           As Match
-    Dim startP      As Long
-    Dim endP        As Long
-    Dim rWhole      As Word.Range
-    Dim displayText As String
-    Dim url         As String
-
-    Set re = New RegExp
-    re.Pattern = "\[(.+?)\]\((https?:\/\/[^\s\)]+)\)"
-    re.Global  = True
-
-    Do
-        Set mcol = re.Execute(rng.Text)
-        If mcol.Count = 0 Then Exit Do
-        Set m      = mcol(mcol.Count - 1)
-        startP     = rng.Start + m.FirstIndex
-        endP       = startP + m.Length
-        Set rWhole = rng.Document.Range(startP, endP)
-        displayText = m.SubMatches(0)
-        url         = m.SubMatches(1)
-        rWhole.Text = displayText
-        rng.Document.Hyperlinks.Add Anchor:=rWhole, Address:=url, TextToDisplay:=displayText
-    Loop
+Private Sub RunRegexStrike(rng As Word.Range, re As Object)
+    ApplyFormatSimple rng, re, 4
 End Sub
 
-' Helper to apply bold and/or italic based on marker type.
-Private Sub ApplyInlineFormatting( _
-        rng As Word.Range, _
-        ByVal pattern As String, _
-        ByVal formatType As Long)
-    Dim re      As RegExp
-    Dim mcol    As MatchCollection
-    Dim m       As Match
-    Dim marker  As String
+Private Sub ApplyFormatSimple(rng As Word.Range, re As Object, fmtType As Long)
+    Dim mCol As Object
+    Dim m As Object
+    Dim startP As Long
     Dim markLen As Long
-    Dim startP  As Long
-    Dim endP    As Long
-    Dim rWhole  As Word.Range
-    Dim rInner  As Word.Range
+    Dim rWhole As Word.Range
     Dim rMarker As Word.Range
-
-    Set re = New RegExp
-    re.Pattern = pattern
-    re.Global  = True
-
+    Dim doc As Word.Document
+    
+    Set doc = rng.Parent
+    
     Do
-        Set mcol = re.Execute(rng.Text)
-        If mcol.Count = 0 Then Exit Do
-        Set m       = mcol(mcol.Count - 1)
-        marker      = m.SubMatches(0)
-        markLen     = Len(marker)
-        startP      = rng.Start + m.FirstIndex
-        endP        = startP + m.Length
-        Set rWhole  = rng.Document.Range(startP, endP)
-
-        Set rMarker = rng.Document.Range(rWhole.End - markLen, rWhole.End)
+        Set mCol = re.Execute(rng.Text)
+        If mCol.Count = 0 Then Exit Do
+        
+        Set m = mCol(mCol.Count - 1)
+        markLen = Len(m.SubMatches(0))
+        startP = rng.Start + m.FirstIndex
+        
+        Set rWhole = doc.Range(startP, startP + m.Length)
+        
+        Set rMarker = doc.Range(rWhole.End - markLen, rWhole.End)
         rMarker.Delete
-
-        Set rMarker = rng.Document.Range(rWhole.Start, rWhole.Start + markLen)
+        
+        Set rMarker = doc.Range(rWhole.Start, rWhole.Start + markLen)
         rMarker.Delete
-
-        Set rInner = rWhole
-
-        Select Case formatType
+        
+        Select Case fmtType
             Case 0
-                rInner.Font.Bold   = True
-                rInner.Font.Italic = True
+                rWhole.Font.Bold = True
+                rWhole.Font.Italic = True
             Case 1
-                rInner.Font.Bold   = True
+                rWhole.Font.Bold = True
             Case 2
-                rInner.Font.Italic = True
+                rWhole.Font.Italic = True
+            Case 4
+                rWhole.Font.Strikethrough = True
         End Select
     Loop
+End Sub
+
+' --------------------------------------------------------------------------
+' CLEANUP
+' --------------------------------------------------------------------------
+Private Sub RemoveEmptyParagraphs(rng As Word.Range)
+    Dim i As Long
+    Dim p As Word.Paragraph
+    
+    For i = rng.Paragraphs.Count To 1 Step -1
+        Set p = rng.Paragraphs(i)
+        
+        If Len(p.Range.Text) <= 1 And Not IsParagraphCode(p) Then
+            p.Range.Delete
+        End If
+    Next i
 End Sub
