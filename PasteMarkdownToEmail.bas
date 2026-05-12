@@ -1,7 +1,10 @@
 ' ==========================================================================
 ' MODULE:       OutlookMarkdownPaster
-' DESCRIPTION:  Pastes Clipboard Markdown into Outlook Email as Formatted Text
-' DEPENDENCIES: 1. Microsoft Word 16.0 Object Library
+' DESCRIPTION: Pastes Clipboard Markdown into Outlook Email as Formatted Text
+' DEPENDENCIES: Microsoft Word Object Library
+'
+' Required in Outlook VBA:
+' Tools > References > Microsoft Word 16.0 Object Library
 '
 ' Notes:
 ' - Uses late-bound VBScript.RegExp, so no explicit Regex reference is required.
@@ -15,6 +18,8 @@ Option Explicit
 ' --------------------------------------------------------------------------
 Private Const REMOVE_EMPTY_PARAGRAPHS_AFTER_PASTE As Boolean = False
 Private Const CODE_STYLE_NAME As String = "Code"
+Private Const TABLE_FONT_NAME As String = "Calibri"
+Private Const TABLE_FONT_SIZE As Long = 9
 
 ' --------------------------------------------------------------------------
 ' PUBLIC MACRO: Link this to your Ribbon Button
@@ -82,7 +87,7 @@ Public Sub PasteMarkdownToEmail()
     End With
     
     ' Refresh range after line-break normalization
-    Set rng = doc.Range(Start:=startPos, End:=endPos)
+    Set rng = doc.Range(Start:=startPos, End:=sel.Range.End)
     
     ' 6. Run Markdown processing
     ProcessCodeBlocks rng
@@ -179,16 +184,16 @@ End Sub
 
 ' --------------------------------------------------------------------------
 ' LOGIC: Markdown Tables
-' Converts standard Markdown pipe tables into native Word tables.
 '
-' Example:
-' | Topic | Owner | Status |
-' |---|---|---|
-' | Item | Walid | Open |
-'
-' Alignment supported:
-' | Left | Center | Right |
-' |:---|:---:|---:|
+' Supported separator formats:
+' ---      left
+' :---     left
+' :---:    center
+' ---:     right
+' -        left
+' :-       left
+' :-:      center
+' -:       right
 ' --------------------------------------------------------------------------
 Private Sub ProcessMarkdownTables(rng As Word.Range)
     Dim i As Long
@@ -327,8 +332,8 @@ Private Sub FormatMarkdownTable(tbl As Word.Table, alignments As Variant)
     tbl.AutoFitBehavior wdAutoFitWindow
     
     With tbl.Range
-        .Font.Name = "Calibri"
-        .Font.Size = 11
+        .Font.Name = TABLE_FONT_NAME
+        .Font.Size = TABLE_FONT_SIZE
     End With
     
     With tbl.rows(1).Range
@@ -423,25 +428,39 @@ End Function
 
 Private Function IsMarkdownSeparatorCell(ByVal s As String) As Boolean
     Dim t As String
+    Dim core As String
+    Dim i As Long
+    
     t = Trim(s)
     t = Replace(t, " ", "")
     
-    If Len(t) < 3 Then
+    If Len(t) = 0 Then
         IsMarkdownSeparatorCell = False
         Exit Function
     End If
     
-    If Left(t, 1) = ":" Then t = Mid(t, 2)
-    If Right(t, 1) = ":" Then t = Left(t, Len(t) - 1)
+    ' Remove optional left and right alignment colons
+    core = t
     
-    If Len(t) < 3 Then
+    If Left(core, 1) = ":" Then
+        core = Mid(core, 2)
+    End If
+    
+    If Len(core) > 0 Then
+        If Right(core, 1) = ":" Then
+            core = Left(core, Len(core) - 1)
+        End If
+    End If
+    
+    ' Must contain at least one dash after removing optional colons.
+    ' This intentionally accepts both "-" and "---".
+    If Len(core) < 1 Then
         IsMarkdownSeparatorCell = False
         Exit Function
     End If
     
-    Dim i As Long
-    For i = 1 To Len(t)
-        If Mid(t, i, 1) <> "-" Then
+    For i = 1 To Len(core)
+        If Mid(core, i, 1) <> "-" Then
             IsMarkdownSeparatorCell = False
             Exit Function
         End If
@@ -508,6 +527,13 @@ Private Function CleanMarkdownTableCell(ByVal s As String) As String
     s = Replace(s, "<br/>", Chr(11))
     s = Replace(s, "<br />", Chr(11))
     
+    ' Decode common HTML entities often produced by email/chat/AI tools
+    s = Replace(s, "&amp;", "&")
+    s = Replace(s, "&lt;", "<")
+    s = Replace(s, "&gt;", ">")
+    s = Replace(s, "&quot;", Chr(34))
+    s = Replace(s, "&#39;", "'")
+    
     CleanMarkdownTableCell = s
 End Function
 
@@ -529,6 +555,7 @@ End Function
 
 Private Function MarkdownAlignmentFromSeparator(ByVal s As String) As Long
     Dim t As String
+    
     t = Trim(s)
     t = Replace(t, " ", "")
     
